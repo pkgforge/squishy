@@ -20,6 +20,31 @@ const SQUASHFS_MAGIC: &[u8] = b"hsqs";
 /// `.desktop`-suffixed binaries without reading them.
 const MAX_DESKTOP_SIZE: u64 = 1 << 20;
 
+/// Ranks a desktop file candidate for [`AppImage::find_desktop`].
+///
+/// Lower sorts first: the image root (the AppImage-spec location) beats
+/// `/usr/share/applications/`, which beats any other path. Within a location,
+/// a file stem exactly matching the filter is preferred, then paths compare
+/// lexicographically for a deterministic order.
+fn desktop_rank(path: &Path, filter: Option<&str>) -> (u8, u8, PathBuf) {
+    let lossy = path.to_string_lossy().to_lowercase();
+    let trimmed = lossy.trim_start_matches('/');
+    let location = if !trimmed.contains('/') {
+        0
+    } else if trimmed.starts_with("usr/share/applications/")
+        || lossy.contains("/usr/share/applications/")
+    {
+        1
+    } else {
+        2
+    };
+    let stem_mismatch = match (filter, path.file_stem()) {
+        (Some(filter), Some(stem)) if stem.eq_ignore_ascii_case(filter) => 0,
+        _ => 1,
+    };
+    (location, stem_mismatch, path.to_path_buf())
+}
+
 /// Returns whether the given bytes are a desktop entry file.
 fn is_desktop_file(bytes: &[u8]) -> bool {
     if bytes.starts_with(goblin::elf::header::ELFMAG) {
@@ -294,7 +319,11 @@ impl<'a> AppImage<'a> {
     ///
     /// The `.desktop` suffix alone is not enough, since a binary can share it.
     /// Oversized candidates are skipped and the contents are verified to be a
-    /// desktop entry, preferring files under `/usr/share/applications/`.
+    /// desktop entry. Candidates are ranked by location: the AppImage-spec
+    /// desktop file at the image root wins, then `/usr/share/applications/`,
+    /// then anything else. Within a location, a file stem exactly matching the
+    /// filter is preferred, so bundled rootfs entries don't shadow the app's
+    /// own desktop file.
     ///
     /// # Returns
     /// A unified entry to the desktop file, if found
@@ -309,13 +338,8 @@ impl<'a> AppImage<'a> {
             .filter(|entry| entry.kind == AppImageEntryKind::File && entry.size <= MAX_DESKTOP_SIZE)
             .collect();
 
-        candidates.sort_by_key(|entry| {
-            !entry
-                .path
-                .to_string_lossy()
-                .to_lowercase()
-                .contains("/usr/share/applications/")
-        });
+        let filter = self.filter;
+        candidates.sort_by_cached_key(|entry| desktop_rank(&entry.path, filter));
 
         candidates.into_iter().find(|entry| {
             self.read_entry(entry)
@@ -483,7 +507,58 @@ impl<'a> AppImage<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_desktop_file;
+    use std::path::{Path, PathBuf};
+
+    use super::{desktop_rank, is_desktop_file};
+
+    fn ranked(paths: &[&str], filter: Option<&str>) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        paths.sort_by_cached_key(|p| desktop_rank(p, filter));
+        paths
+    }
+
+    #[test]
+    fn prefers_root_desktop_over_bundled_rootfs() {
+        let order = ranked(
+            &[
+                "/usr/share/applications/avahi-discover.desktop",
+                "/usr/share/applications/steam.desktop",
+                "/steam.desktop",
+            ],
+            None,
+        );
+        assert_eq!(order[0], Path::new("/steam.desktop"));
+    }
+
+    #[test]
+    fn prefers_stem_matching_filter_within_location() {
+        let order = ranked(
+            &[
+                "/usr/share/applications/steam-screensaver-fix.desktop",
+                "/usr/share/applications/steam.desktop",
+            ],
+            Some("steam"),
+        );
+        assert_eq!(
+            order[0],
+            Path::new("/usr/share/applications/steam.desktop")
+        );
+    }
+
+    #[test]
+    fn prefers_applications_dir_over_other_paths() {
+        let order = ranked(
+            &[
+                "/usr/lib/steam/steam.desktop",
+                "/usr/share/applications/steam.desktop",
+            ],
+            None,
+        );
+        assert_eq!(
+            order[0],
+            Path::new("/usr/share/applications/steam.desktop")
+        );
+    }
 
     #[test]
     fn detects_desktop_entry() {
