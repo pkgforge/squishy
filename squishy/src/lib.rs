@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     fs::{self, File, Permissions},
     io::{BufReader, BufWriter, Read, Seek},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{symlink, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -75,7 +75,7 @@ impl<'a> SquashFS<'a> {
     ///
     /// # Returns
     /// A SquashFS instance if the SquashFS data is found and valid, or an error if it is not.
-    pub fn from_path<P: AsRef<Path>>(path: &'a P) -> Result<Self> {
+    pub fn from_path<P: AsRef<Path> + ?Sized>(path: &'a P) -> Result<Self> {
         let file = File::open(path).unwrap();
         let reader = BufReader::new(file);
         SquashFS::new(reader, None)
@@ -89,7 +89,10 @@ impl<'a> SquashFS<'a> {
     ///
     /// # Returns
     /// A SquashFS instance if the SquashFS data is found and valid, or an error if it is not.
-    pub fn from_path_with_offset<P: AsRef<Path>>(path: &'a P, offset: u64) -> Result<Self> {
+    pub fn from_path_with_offset<P: AsRef<Path> + ?Sized>(
+        path: &'a P,
+        offset: u64,
+    ) -> Result<Self> {
         let file = File::open(path).unwrap();
         let reader = BufReader::new(file);
         SquashFS::new(reader, Some(offset))
@@ -262,6 +265,66 @@ impl<'a> SquashFS<'a> {
         Ok(())
     }
 
+    /// Extracts the whole image into `dest`, creating the directory when missing.
+    ///
+    /// Files are written with their stored permissions and symlink targets are
+    /// preserved verbatim, matching `unsquashfs` output: the image is read,
+    /// never mounted, so a link keeps exactly the text its author wrote.
+    /// Directory permissions are applied after their contents, so an image
+    /// shipping read-only directories does not block its own extraction.
+    /// Device nodes, pipes, and sockets are skipped; they describe the image's
+    /// own environment and have no meaning on the host.
+    pub fn extract(&self, dest: &Path) -> Result<()> {
+        fs::create_dir_all(dest)?;
+        let mut dirs = Vec::new();
+
+        for node in self.reader.files() {
+            // Entries carry their absolute path inside the image
+            // ("/usr/bin/tool"); the root itself is already `dest`.
+            let Ok(relative) = node.fullpath.strip_prefix("/") else {
+                continue;
+            };
+            if relative.as_os_str().is_empty() {
+                continue;
+            }
+            let path = dest.join(relative);
+
+            match &node.inner {
+                InnerNode::File(file) => {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    let mut out = File::create(&path)?;
+                    let mut source = self.reader.file(file).reader();
+                    std::io::copy(&mut source, &mut out)?;
+                    fs::set_permissions(
+                        &path,
+                        Permissions::from_mode(u32::from(node.header.permissions)),
+                    )?;
+                }
+                InnerNode::Symlink(link) => {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    let _ = fs::remove_file(&path);
+                    symlink(&link.link, &path)?;
+                }
+                InnerNode::Dir(_) => {
+                    fs::create_dir_all(&path)?;
+                    dirs.push((path, node.header.permissions));
+                }
+                InnerNode::CharacterDevice(_) | InnerNode::BlockDevice(_) => {}
+                InnerNode::NamedPipe | InnerNode::Socket => {}
+            }
+        }
+
+        for (path, permissions) in dirs {
+            fs::set_permissions(&path, Permissions::from_mode(u32::from(permissions)))?;
+        }
+
+        Ok(())
+    }
+
     /// Resolves the symlink chain starting from the specified entry,
     /// returning the final target entry or an error if a cycle is detected.
     ///
@@ -309,5 +372,99 @@ impl<'a> SquashFS<'a> {
         } else {
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use backhand::FilesystemWriter;
+    use std::io::Cursor;
+    use tempfile::TempDir;
+
+    fn header(permissions: u16) -> NodeHeader {
+        NodeHeader::new(permissions, 0, 0, 0)
+    }
+
+    fn write_image(path: &Path) {
+        let mut fs = FilesystemWriter::default();
+        fs.push_dir_all("/usr/bin", header(0o755)).unwrap();
+        fs.push_dir_all("/usr/lib", header(0o755)).unwrap();
+        fs.push_dir_all("/etc/empty", header(0o755)).unwrap();
+        fs.push_dir_all("/etc/readonly", header(0o555)).unwrap();
+        fs.push_file(
+            Cursor::new(b"#!/bin/sh\necho hi\n".to_vec()),
+            "/usr/bin/tool",
+            header(0o755),
+        )
+        .unwrap();
+        fs.push_file(
+            Cursor::new(b"library bytes".to_vec()),
+            "/usr/lib/libdemo.so.1.0",
+            header(0o644),
+        )
+        .unwrap();
+        fs.push_file(
+            Cursor::new(b"config".to_vec()),
+            "/etc/readonly/config",
+            header(0o644),
+        )
+        .unwrap();
+        fs.push_symlink("libdemo.so.1.0", "/usr/lib/libdemo.so", header(0o777))
+            .unwrap();
+        fs.push_symlink("/usr/bin/tool", "/usr/bin/tool-absolute", header(0o777))
+            .unwrap();
+
+        fs.write(File::create(path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn extract_preserves_contents_links_and_modes() {
+        let dir = TempDir::new().unwrap();
+        let image = dir.path().join("demo.squashfs");
+        write_image(&image);
+
+        let dest = dir.path().join("out");
+        SquashFS::from_path(&image).unwrap().extract(&dest).unwrap();
+
+        let tool = dest.join("usr/bin/tool");
+        assert_eq!(fs::read(&tool).unwrap(), b"#!/bin/sh\necho hi\n");
+        assert_eq!(
+            fs::metadata(&tool).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        let lib = dest.join("usr/lib/libdemo.so.1.0");
+        assert_eq!(fs::read(&lib).unwrap(), b"library bytes");
+        assert_eq!(
+            fs::metadata(&lib).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        // Relative and absolute targets both survive verbatim, as with
+        // unsquashfs.
+        assert_eq!(
+            fs::read_link(dest.join("usr/lib/libdemo.so")).unwrap(),
+            Path::new("libdemo.so.1.0")
+        );
+        assert_eq!(
+            fs::read_link(dest.join("usr/bin/tool-absolute")).unwrap(),
+            Path::new("/usr/bin/tool")
+        );
+
+        assert!(dest.join("etc/empty").is_dir());
+
+        // A read-only directory in the image must not block its own files,
+        // and its mode is still applied once the contents are in place.
+        let config = dest.join("etc/readonly/config");
+        assert_eq!(fs::read(&config).unwrap(), b"config");
+        assert_eq!(
+            fs::metadata(dest.join("etc/readonly"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
     }
 }

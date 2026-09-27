@@ -9,6 +9,7 @@ A convenient wrapper around the [backhand](https://github.com/wcampbell0x2a/back
 
 - 📚 **Library Features**
   - Read and extract files from SquashFS and DwarFS filesystems
+  - Extract whole images to a directory, preserving permissions and symlink targets
   - Traverse filesystem entries
   - Handle symlinks with cycle detection
   - Search for files using custom predicates
@@ -42,7 +43,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-squishy = "0.2.1"
+squishy = "0.5.3"
 ```
 
 ### Example
@@ -75,6 +76,11 @@ for entry in squashfs.entries() {
 // Read a specific file
 // Note: the whole file content will be loaded into memory
 let contents = squashfs.read_file("path/to/file.txt")?;
+
+// Extract the whole image to a directory
+// Files keep their stored permissions, symlink targets are preserved
+// verbatim, and directory modes are applied after their contents
+squashfs.extract("/path/to/output/dir")?;
 ```
 
 ## CLI Usage

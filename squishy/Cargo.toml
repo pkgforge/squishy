@@ -40,3 +40,6 @@ thiserror = "2.0.18"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"], optional = true }
 zerocopy = { version = "0.8.52", features = ["derive", "std"], optional = true }
 zstd-safe = { version = "7.2.4", default-features = false, optional = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"
